@@ -3,6 +3,9 @@ data/mtg-default-cards.json
 mtg_images/
 chroma_db/
 
+# Scan result exports
+scan_results_*.csv
+
 # Debug/output images
 card_image.jpg
 card_image_original.jpg
