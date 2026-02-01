@@ -1,0 +1,40 @@
+# Large data files - too big for git
+data/mtg-default-cards.json
+mtg_images/
+chroma_db/
+
+# Debug/output images
+card_image.jpg
+card_image_original.jpg
+aruco_image.jpg
+pre_image.jpg
+edges.jpg
+debug_contour.jpg
+debug_frame.jpg
+contours.jpg
+approx_polygon.jpg
+largest_contour.jpg
+test_card.jpg
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

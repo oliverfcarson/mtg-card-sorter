@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:medium.com)",
+      "Bash(python download.py:*)"
+    ]
+  }
+}

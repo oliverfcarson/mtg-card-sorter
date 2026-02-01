@@ -2,39 +2,36 @@ from keras.applications.vgg16 import VGG16
 from keras.applications.vgg16 import preprocess_input
 import numpy as np
 from keras.preprocessing import image
+import chromadb
 
-import redis
-from redis.commands.search.query import Query
+CHROMA_DB_PATH = "./chroma_db"
 
 #Load the VGG16 model
 nn = VGG16(weights='imagenet',  include_top=False)
-redis_conn = redis.StrictRedis(host='127.0.0.1', port=6379, db=0)
 
-img = image.load_img("McDo.jpg", target_size=(224, 224))
-    
+# Connect to ChromaDB
+chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+collection = chroma_client.get_collection(name="mtg_cards")
+
+img = image.load_img("card_image.jpg", target_size=(224, 224))
+
 img = image.img_to_array(img)
 x = preprocess_input(np.expand_dims(img.copy(), axis=0))
 print("Sending image to model")
 preds = nn.predict(x, verbose=None)
-vector = preds.flatten()
-#embed = np.array(vector, dtype=np.float32).tobytes()
-embed = np.array(vector).astype(dtype=np.float32).tobytes()
+vector = preds.flatten().tolist()
 
-
-return_fields = ["set", "num", "vector_score"]
-base_query = f'*=>[KNN 20 @content_vector $vector AS vector_score]'
-
-query = (
-    Query(base_query)
-        .return_fields(*return_fields)
-        .sort_by("vector_score")
-        .paging(0, 5)
-        .dialect(2)
+# Query ChromaDB for similar cards
+results = collection.query(
+    query_embeddings=[vector],
+    n_results=5
 )
 
-params_dict = {"vector": embed}
-result = redis_conn.ft("mtg_cards").search(query, params_dict)
-
-for i, article in enumerate(result.docs):
-    score = 1 - float(article.vector_score)
-    print(f"{i}. {article.set} {article.num} (Score: {round(score ,3) })")
+# Display results
+for i in range(len(results['ids'][0])):
+    card_id = results['ids'][0][i]
+    metadata = results['metadatas'][0][i]
+    distance = results['distances'][0][i]
+    # ChromaDB returns cosine distance, convert to similarity score
+    score = 1 - distance
+    print(f"{i}. {metadata['set']} {metadata['num']} (Score: {round(score, 3)})")
