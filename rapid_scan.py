@@ -1,8 +1,12 @@
 import cv2
 import numpy as np
 from itertools import combinations
-from keras.applications.vgg16 import VGG16
-from keras.applications.vgg16 import preprocess_input
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.applications.vgg16 import preprocess_input
+import torch
+import torch.nn as nn
+from torchvision import transforms, models
+from PIL import Image
 import chromadb
 from threading import Thread
 from queue import Queue
@@ -50,15 +54,59 @@ else:
     print("       CSV export will have limited information")
 
 # ============== LOAD MODEL & DATABASE ==============
-print("\n[2/4] Loading AI model...")
-nn = VGG16(weights='imagenet', include_top=False)
-print("       Model loaded!")
+print("\n[2/4] Loading VGG16 model...")
+
+# Load VGG16 for feature extraction (include_top=False gives 25088-dim vectors to match database)
+vgg_model = VGG16(weights='imagenet', include_top=False)
+print("       VGG16 model loaded!")
 
 CHROMA_DB_PATH = "./chroma_db"
 print("       Connecting to card database...")
 chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+
 collection = chroma_client.get_collection(name="mtg_cards")
-print(f"       Database connected! ({collection.count():,} cards)")
+print(f"       Card database connected! ({collection.count():,} cards)")
+
+# Load CNN set classifier
+print("       Loading set symbol CNN classifier...")
+SET_CLASSIFIER_PATH = "./models/set_classifier_latest.pth"
+set_classifier = None
+set_idx_to_class = None
+SET_CNN_ENABLED = False
+
+# Define device and transform at module level
+cnn_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+set_cnn_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+if os.path.exists(SET_CLASSIFIER_PATH):
+    try:
+        # Load model checkpoint
+        checkpoint = torch.load(SET_CLASSIFIER_PATH, map_location=cnn_device, weights_only=False)
+
+        num_classes = checkpoint['num_classes']
+        set_idx_to_class = checkpoint['idx_to_class']
+
+        # Create model architecture
+        set_classifier = models.resnet18(weights=None)
+        set_classifier.fc = nn.Linear(set_classifier.fc.in_features, num_classes)
+        set_classifier.load_state_dict(checkpoint['model_state_dict'])
+        set_classifier = set_classifier.to(cnn_device)
+        set_classifier.eval()
+
+        print(f"       Set CNN loaded! ({num_classes} classes, using {cnn_device})")
+        if checkpoint.get('best_val_acc'):
+            print(f"       Model validation accuracy: {checkpoint['best_val_acc']:.1f}%")
+        SET_CNN_ENABLED = True
+    except Exception as e:
+        print(f"       Warning: Failed to load set CNN: {e}")
+        print("       Continuing without set symbol classification...")
+else:
+    print("       Warning: Set classifier not found. Run train_set_classifier.py first.")
+    print("       Continuing without set symbol classification...")
 
 def get_card_info(set_code, collector_num):
     """Look up full card info from the JSON data"""
@@ -80,18 +128,27 @@ def get_card_info(set_code, collector_num):
 
 # ============== IMAGE PROCESSING FUNCTIONS ==============
 def enhance_card_image(image):
-    """Enhance card image for better matching"""
+    """Enhance card image for better matching with aggressive sharpening"""
+    # Step 1: CLAHE for contrast enhancement
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l_enhanced = clahe.apply(l)
     lab_enhanced = cv2.merge([l_enhanced, a, b])
     enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
-    kernel = np.array([[-0.5, -0.5, -0.5],
-                       [-0.5,  5.0, -0.5],
-                       [-0.5, -0.5, -0.5]])
-    sharpened = cv2.filter2D(enhanced, -1, kernel)
-    result = cv2.addWeighted(enhanced, 0.5, sharpened, 0.5, 0)
+
+    # Step 2: Unsharp mask for aggressive sharpening (brings out text/details)
+    gaussian = cv2.GaussianBlur(enhanced, (0, 0), 3)
+    sharpened = cv2.addWeighted(enhanced, 2.0, gaussian, -1.0, 0)
+
+    # Step 3: Additional high-pass sharpening for fine details (collector numbers, set symbols)
+    kernel = np.array([[-1, -1, -1],
+                       [-1,  9, -1],
+                       [-1, -1, -1]])
+    sharpened = cv2.filter2D(sharpened, -1, kernel)
+
+    # Blend: 70% sharpened, 30% enhanced (mostly sharp, some smoothness to reduce noise)
+    result = cv2.addWeighted(enhanced, 0.3, sharpened, 0.7, 0)
     return result
 
 def calculate_sharpness(image):
@@ -99,6 +156,132 @@ def calculate_sharpness(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     laplacian = cv2.Laplacian(gray, cv2.CV_64F)
     return laplacian.var()
+
+
+def extract_set_symbol_region(card_image):
+    """
+    Extract the set symbol region from a card image.
+    The set symbol is located on the right side, in the type line area.
+    """
+    height, width = card_image.shape[:2]
+
+    # Set symbol region (same as in build_set_database.py):
+    # - Horizontal: 82-98% from left (right side of card)
+    # - Vertical: 54-64% from top (in the type line area)
+    x1 = int(width * 0.82)
+    x2 = int(width * 0.98)
+    y1 = int(height * 0.54)
+    y2 = int(height * 0.64)
+
+    symbol_region = card_image[y1:y2, x1:x2]
+    return symbol_region
+
+
+def classify_set_symbol(card_image, top_n=10):
+    """
+    Classify the set symbol using the trained CNN.
+    Returns list of (set_code, confidence) tuples sorted by confidence descending.
+    """
+    if not SET_CNN_ENABLED or set_classifier is None:
+        return []
+
+    try:
+        # Extract set symbol region
+        symbol_region = extract_set_symbol_region(card_image)
+
+        if symbol_region.size == 0:
+            return []
+
+        # Convert to PIL Image for PyTorch
+        symbol_rgb = cv2.cvtColor(symbol_region, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(symbol_rgb)
+
+        # Preprocess for CNN
+        img_tensor = set_cnn_transform(pil_image).unsqueeze(0).to(cnn_device)
+
+        # Get CNN predictions
+        with torch.no_grad():
+            outputs = set_classifier(img_tensor)
+            probabilities = torch.nn.functional.softmax(outputs, dim=1)
+
+            # Get top N predictions
+            top_probs, top_indices = torch.topk(probabilities, min(top_n, probabilities.size(1)))
+
+            matches = []
+            for prob, idx in zip(top_probs[0], top_indices[0]):
+                set_code = set_idx_to_class[idx.item()]
+                confidence = prob.item()
+                matches.append((set_code, confidence))
+
+            return matches
+    except Exception as e:
+        print(f"       Warning: CNN classification error: {e}")
+        return []
+
+
+# Keep old function name for compatibility
+def match_set_symbol(card_image, top_n=10):
+    """Wrapper for backward compatibility - now uses CNN classification."""
+    return classify_set_symbol(card_image, top_n)
+
+
+def refine_with_set_symbol(card_image, vgg_results, card_lookup):
+    """
+    Refine VGG16 card results using CNN set symbol classification.
+    Strategy:
+    1. Get CNN predictions for the set symbol
+    2. Look for VGG16 candidates that match a predicted set
+    3. Boost candidates that match both card appearance and set prediction
+    """
+    # Get set symbol matches
+    set_matches = match_set_symbol(card_image, top_n=10)
+
+    if not set_matches:
+        # No set symbol matching available, return original top result
+        top_match = vgg_results['metadatas'][0][0]
+        top_score = 1 - vgg_results['distances'][0][0]
+        return top_match, top_score, None
+
+    # Create a set of likely set codes from set symbol matching
+    likely_sets = {code: score for code, score in set_matches}
+
+    # Score each VGG16 candidate based on combined card + set symbol match
+    best_match = None
+    best_combined_score = -1
+    set_match_info = None
+
+    for i in range(len(vgg_results['ids'][0])):
+        meta = vgg_results['metadatas'][0][i]
+        distance = vgg_results['distances'][0][i]
+        card_score = 1 - distance
+
+        candidate_set = meta['set']
+
+        # Check if this candidate's set matches a top set symbol
+        if candidate_set in likely_sets:
+            set_score = likely_sets[candidate_set]
+            # Combined score: weight card match higher (70%) than set symbol (30%)
+            combined_score = (card_score * 0.7) + (set_score * 0.3)
+
+            if combined_score > best_combined_score:
+                best_combined_score = combined_score
+                best_match = meta
+                set_match_info = {
+                    'set_code': candidate_set,
+                    'set_score': set_score,
+                    'card_score': card_score,
+                    'combined_score': combined_score
+                }
+
+    # If we found a match with set symbol confirmation, return it
+    if best_match is not None:
+        return best_match, best_combined_score, set_match_info
+
+    # No set symbol match in VGG16 candidates, return original top result
+    top_match = vgg_results['metadatas'][0][0]
+    top_score = 1 - vgg_results['distances'][0][0]
+    return top_match, top_score, None
+
 
 def extract_card_from_frame(frame, marker_bounding_boxes):
     """Extract and process card image from frame with ArUco markers"""
@@ -246,8 +429,101 @@ search_queue = Queue()
 results_list = []
 worker_running = True
 
+# Confidence threshold for auto-retry
+CONFIDENCE_THRESHOLD = 0.70  # Below this, we use multi-capture consensus
+MULTI_CAPTURE_COUNT = 5      # Number of frames to capture for consensus
+
+
+def search_single_image(card_image):
+    """Search a single card image and return (match, score, set_info, all_results)"""
+    # Resize and preprocess for VGG16
+    img_resized = cv2.resize(card_image, (224, 224))
+    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+    img_array = np.expand_dims(img_rgb, axis=0)
+    img_preprocessed = preprocess_input(img_array.astype('float32'))
+
+    # Get VGG16 embedding (25088 dimensions)
+    vector = vgg_model.predict(img_preprocessed, verbose=0).flatten().tolist()
+
+    # Query ChromaDB
+    results = collection.query(
+        query_embeddings=[vector],
+        n_results=15
+    )
+
+    # Refine with CNN set classification
+    if SET_CNN_ENABLED:
+        top_match, top_score, set_info = refine_with_set_symbol(card_image, results, card_lookup)
+    else:
+        top_match = results['metadatas'][0][0] if results['metadatas'][0] else None
+        top_score = 1 - results['distances'][0][0] if results['distances'][0] else 0
+        set_info = None
+
+    return top_match, top_score, set_info, results
+
+
+def consensus_vote(search_results):
+    """
+    Use consensus voting from multiple search results.
+    Returns the best match based on voting + score weighting.
+
+    search_results: list of (match, score, set_info, all_results) tuples
+    """
+    if not search_results:
+        return None, 0, None, None
+
+    if len(search_results) == 1:
+        match, score, set_info, all_results = search_results[0]
+        return match, score, set_info, all_results
+
+    # Count votes for each unique card (set:num combination)
+    votes = {}  # key: "set:num", value: {'count': int, 'scores': [], 'matches': [], 'set_infos': [], 'all_results': []}
+
+    for match, score, set_info, all_results in search_results:
+        if match is None:
+            continue
+        key = f"{match['set']}:{match['num']}"
+        if key not in votes:
+            votes[key] = {'count': 0, 'scores': [], 'matches': [], 'set_infos': [], 'all_results': []}
+        votes[key]['count'] += 1
+        votes[key]['scores'].append(score)
+        votes[key]['matches'].append(match)
+        votes[key]['set_infos'].append(set_info)
+        votes[key]['all_results'].append(all_results)
+
+    if not votes:
+        # All searches failed
+        return None, 0, None, None
+
+    # Find the best candidate:
+    # 1. Prefer candidates with more votes
+    # 2. Among ties, prefer higher average score
+    best_key = None
+    best_vote_count = 0
+    best_avg_score = 0
+
+    for key, data in votes.items():
+        avg_score = sum(data['scores']) / len(data['scores'])
+        if data['count'] > best_vote_count or (data['count'] == best_vote_count and avg_score > best_avg_score):
+            best_key = key
+            best_vote_count = data['count']
+            best_avg_score = avg_score
+
+    # Return the best result
+    best_data = votes[best_key]
+    # Use the highest-scoring instance of this card
+    best_idx = best_data['scores'].index(max(best_data['scores']))
+
+    return (
+        best_data['matches'][best_idx],
+        max(best_data['scores']),  # Use best score
+        best_data['set_infos'][best_idx],
+        best_data['all_results'][best_idx]
+    )
+
+
 def search_worker():
-    """Background worker that processes cards and searches database"""
+    """Background worker that processes cards with multi-capture consensus"""
     global results_list, worker_running
 
     while worker_running:
@@ -256,42 +532,55 @@ def search_worker():
             if item is None:
                 break
 
-            scan_num, card_image, thumbnail = item
+            scan_num, card_images, thumbnail = item
 
-            # Prepare image for VGG16
-            img_resized = cv2.resize(card_image, (224, 224))
-            img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-            img_array = np.expand_dims(img_rgb, axis=0).astype('float32')
-            x = preprocess_input(img_array)
+            # card_images can be a single image or a list of images
+            if not isinstance(card_images, list):
+                card_images = [card_images]
 
-            # Get embedding
-            preds = nn.predict(x, verbose=None)
-            vector = preds.flatten().tolist()
+            # Always use consensus when multiple images available for best accuracy
+            if len(card_images) == 1:
+                # Only one image, search it directly
+                top_match, top_score, set_info, all_results = search_single_image(card_images[0])
+                consensus_used = False
+            else:
+                # Multiple images - always use consensus voting
+                print(f"       [Scan #{scan_num}] Searching {len(card_images)} frames with consensus...")
+                search_results = []
 
-            # Query ChromaDB
-            results = collection.query(
-                query_embeddings=[vector],
-                n_results=5
-            )
+                for img in card_images:
+                    match, score, s_info, results = search_single_image(img)
+                    search_results.append((match, score, s_info, results))
 
-            # Store results
-            top_match = results['metadatas'][0][0] if results['metadatas'][0] else None
-            top_score = 1 - results['distances'][0][0] if results['distances'][0] else 0
+                # Use consensus voting
+                top_match, top_score, set_info, all_results = consensus_vote(search_results)
+                consensus_used = True
+
+            if top_match is None:
+                print(f"       [Scan #{scan_num}] Search failed")
+                continue
 
             results_list.append({
                 'scan_num': scan_num,
                 'thumbnail': thumbnail,
                 'top_match': top_match,
                 'top_score': top_score,
-                'all_results': results
+                'all_results': all_results,
+                'set_info': set_info,
+                'consensus_used': consensus_used if 'consensus_used' in dir() else False
             })
 
             # Look up card name for display
             card_info = get_card_info(top_match['set'], top_match['num'])
-            print(f"       [Scan #{scan_num}] Found: {card_info['name']} ({top_match['set']} #{top_match['num']}) Score: {top_score:.3f}")
+            set_str = ""
+            if set_info:
+                set_str = f" [Set: {set_info['set_code']} ({set_info['set_score']:.2f})]"
+            consensus_str = " [CONSENSUS]" if consensus_used else ""
+            print(f"       [Scan #{scan_num}] Found: {card_info['name']} ({top_match['set']} #{top_match['num']}) Score: {top_score:.3f}{set_str}{consensus_str}")
 
-        except:
-            pass
+        except Exception as e:
+            if str(e):  # Only print if there's an actual error message
+                print(f"       [Worker] Error: {e}")
 
 # Start the search worker thread
 search_thread = Thread(target=search_worker, daemon=True)
@@ -369,7 +658,7 @@ detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
 # ============== RAPID SCAN LOOP ==============
 scan_count = 0
 auto_capture_enabled = True
-AUTO_CAPTURE_THRESHOLD = 80
+AUTO_CAPTURE_THRESHOLD = 50  # Auto-capture when sharpness reaches this level
 STABLE_FRAMES_REQUIRED = 10
 COOLDOWN_FRAMES = 30  # Frames to wait after capture before allowing another
 
@@ -520,19 +809,42 @@ while True:
     # Process capture
     if should_capture:
         scan_count += 1
-        print(f"\n[Scan #{scan_count}] Capturing...")
+        print(f"\n[Scan #{scan_count}] Capturing {MULTI_CAPTURE_COUNT} frames for consensus...")
 
-        card_image = extract_card_from_frame(frame, marker_bounding_boxes)
+        # Capture multiple frames for consensus voting
+        card_images = []
+        thumbnail = None
 
-        if card_image is not None:
-            # Create thumbnail for results display
-            thumbnail = cv2.resize(card_image, (100, 140))
+        for i in range(MULTI_CAPTURE_COUNT):
+            # Use the best frame for first capture, then grab new frames
+            if i == 0:
+                current_frame = frame
+                current_markers = marker_bounding_boxes
+            else:
+                # Small delay then grab a new frame
+                time.sleep(0.05)  # 50ms delay between captures
+                ret, current_frame = CAMERA.read()
+                if not ret:
+                    continue
+                # Re-detect markers in the new frame
+                corners, ids, _ = detector.detectMarkers(current_frame)
+                if ids is None or len(ids) != 4:
+                    continue
+                current_markers = corners
 
-            # Queue for async search
-            search_queue.put((scan_count, card_image, thumbnail))
-            print(f"       Queued for search...")
+            card_image = extract_card_from_frame(current_frame, current_markers)
+
+            if card_image is not None:
+                card_images.append(card_image)
+                if thumbnail is None:
+                    thumbnail = cv2.resize(card_image, (100, 140))
+
+        if card_images:
+            print(f"       Captured {len(card_images)} frames, queuing for search...")
+            # Queue all images for consensus search
+            search_queue.put((scan_count, card_images, thumbnail))
         else:
-            print(f"       Failed to extract card")
+            print(f"       Failed to extract card from any frame")
             scan_count -= 1
 
 # ============== CLEANUP ==============
@@ -565,11 +877,21 @@ if show_results and len(results_list) > 0:
         match = result['top_match']
         score = result['top_score']
         card_info = get_card_info(match['set'], match['num'])
+        set_info = result.get('set_info')
+        consensus_used = result.get('consensus_used', False)
 
         print(f"\nScan #{result['scan_num']}:")
         print(f"  {card_info['name']}")
         print(f"  Set: {card_info['set_name']} ({match['set']}) #{match['num']}")
-        print(f"  Rarity: {card_info['rarity'].capitalize()} | Confidence: {score:.1%}")
+
+        # Show confidence and matching info
+        confidence_str = f"Confidence: {score:.1%}"
+        if consensus_used:
+            confidence_str += " [CONSENSUS]"
+        if set_info:
+            confidence_str += f" (Set symbol: {set_info['set_score']:.1%})"
+        print(f"  Rarity: {card_info['rarity'].capitalize()} | {confidence_str}")
+
         if card_info['prices_usd']:
             print(f"  Price: ${card_info['prices_usd']}")
 
@@ -619,7 +941,12 @@ if show_results and len(results_list) > 0:
 
     # ============== EXPORT CSV ==============
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"scan_results_{timestamp}.csv"
+
+    # Create exports folder if it doesn't exist
+    exports_folder = "./exports"
+    os.makedirs(exports_folder, exist_ok=True)
+
+    csv_filename = os.path.join(exports_folder, f"scan_results_{timestamp}.csv")
 
     print(f"\nExporting results to {csv_filename}...")
 
@@ -681,5 +1008,32 @@ if show_results and len(results_list) > 0:
     unique_cards = len(card_counts)
     total_cards = sum(card_counts.values())
     print(f"Exported {unique_cards} unique cards ({total_cards} total) to {csv_filename}")
+
+# ============== CLEANUP TEMP FILES ==============
+print("\nCleaning up temporary files...")
+temp_files = [
+    "card_image.jpg",
+    "card_image_original.jpg",
+    "aruco_image.jpg",
+    "pre_image.jpg",
+    "edges.jpg",
+    "debug_contour.jpg",
+    "debug_frame.jpg",
+    "contours.jpg",
+    "approx_polygon.jpg",
+    "largest_contour.jpg",
+]
+
+deleted_count = 0
+for temp_file in temp_files:
+    if os.path.exists(temp_file):
+        try:
+            os.remove(temp_file)
+            deleted_count += 1
+        except Exception as e:
+            print(f"       Warning: Could not delete {temp_file}: {e}")
+
+if deleted_count > 0:
+    print(f"       Deleted {deleted_count} temporary files")
 
 print("\nDone!")

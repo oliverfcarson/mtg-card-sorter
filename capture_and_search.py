@@ -69,28 +69,27 @@ def calculate_contrast(image):
     return gray.std()
 
 def enhance_card_image(image):
-    """Enhance card image for better matching"""
-    # 1. Convert to LAB color space for better processing
+    """Enhance card image for better matching with aggressive sharpening"""
+    # Step 1: CLAHE for contrast enhancement
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-
-    # 2. Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to L channel
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l_enhanced = clahe.apply(l)
-
-    # 3. Merge back
     lab_enhanced = cv2.merge([l_enhanced, a, b])
     enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
 
-    # 4. Slight sharpening
-    kernel = np.array([[-0.5, -0.5, -0.5],
-                       [-0.5,  5.0, -0.5],
-                       [-0.5, -0.5, -0.5]])
-    sharpened = cv2.filter2D(enhanced, -1, kernel)
+    # Step 2: Unsharp mask for aggressive sharpening (brings out text/details)
+    gaussian = cv2.GaussianBlur(enhanced, (0, 0), 3)
+    sharpened = cv2.addWeighted(enhanced, 2.0, gaussian, -1.0, 0)
 
-    # 5. Blend original with sharpened (50% each for subtle effect)
-    result = cv2.addWeighted(enhanced, 0.5, sharpened, 0.5, 0)
+    # Step 3: Additional high-pass sharpening for fine details (collector numbers, set symbols)
+    kernel = np.array([[-1, -1, -1],
+                       [-1,  9, -1],
+                       [-1, -1, -1]])
+    sharpened = cv2.filter2D(sharpened, -1, kernel)
 
+    # Blend: 70% sharpened, 30% enhanced (mostly sharp, some smoothness to reduce noise)
+    result = cv2.addWeighted(enhanced, 0.3, sharpened, 0.7, 0)
     return result
 
 # Track quality metrics for smart auto-capture

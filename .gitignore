@@ -1,10 +1,16 @@
 # Large data files - too big for git
 data/mtg-default-cards.json
+data/mtg-sets.json
 mtg_images/
+set_icons/
 chroma_db/
 
+# CNN training data and models
+set_symbols_cropped/
+models/
+
 # Scan result exports
-scan_results_*.csv
+exports/
 
 # Debug/output images
 card_image.jpg

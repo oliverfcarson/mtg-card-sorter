@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:medium.com)",
-      "Bash(python download.py:*)"
+      "Bash(python download.py:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(pip show:*)",
+      "Bash(dir:*)"
     ]
   }
 }
