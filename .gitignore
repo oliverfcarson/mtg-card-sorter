@@ -4,6 +4,7 @@ data/mtg-sets.json
 mtg_images/
 set_icons/
 chroma_db/
+chroma_db_embeddings/
 
 # CNN training data and models
 set_symbols_cropped/
