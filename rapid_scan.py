@@ -617,6 +617,8 @@ CAMERA.set(cv2.CAP_PROP_AUTOFOCUS, 1)
 
 current_focus = 0
 manual_focus_mode = False
+focus_calibrated = False  # True when focus is locked for instant capture
+calibrated_sharpness = 0  # Sharpness at calibration time
 
 print(f"       Webcam opened successfully!")
 
@@ -625,12 +627,16 @@ print("\n[4/4] Ready for rapid scanning!")
 print("=" * 50)
 print("Controls:")
 print("  SPACE  = Capture card manually")
-print("  A      = Toggle auto-capture")
+print("  A      = Toggle auto-capture mode")
+print("  C      = Calibrate focus for INSTANT capture (place card first)")
+print("  U      = Uncalibrate (return to auto-focus)")
 print("  R      = Show results and exit")
 print("  Q      = Quit without results")
 print("  F      = Toggle focus mode")
 print("  +/-    = Adjust manual focus")
 print("=" * 50)
+print("\nFor automated scanning: Place card, press C to calibrate, then")
+print("cards will be captured INSTANTLY when markers are detected.")
 
 ARUCO_DICTS = {
     1: ("4X4_50", cv2.aruco.DICT_4X4_50),
@@ -720,16 +726,24 @@ while True:
         auto_status = f"COOLDOWN: {cooldown_counter}"
         auto_color = (0, 165, 255)
     elif auto_capture_enabled:
-        if peak_detected:
+        if focus_calibrated:
+            auto_status = "INSTANT MODE - Ready"
+            auto_color = (0, 255, 0)
+        elif peak_detected:
             auto_status = f"AUTO: Tracking... ({frames_since_peak}/{STABLE_FRAMES_REQUIRED})"
             auto_color = (0, 255, 255)
         else:
-            auto_status = "AUTO: Ready"
+            auto_status = "AUTO: Ready (C=calibrate for instant)"
             auto_color = (0, 255, 0)
     else:
         auto_status = "AUTO: OFF (A=toggle)"
         auto_color = (150, 150, 150)
     cv2.putText(preview, auto_status, (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, auto_color, 2)
+
+    # Show calibration status
+    if focus_calibrated:
+        cv2.putText(preview, f"CALIBRATED (Focus locked, sharpness baseline: {int(calibrated_sharpness)})",
+                    (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
     cv2.putText(preview, "SPACE=Capture | R=Results | Q=Quit", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
@@ -743,25 +757,33 @@ while True:
     # Smart auto-capture logic
     should_capture = False
     if auto_capture_enabled and cooldown_counter == 0 and ids is not None and len(ids) == 4:
-        if sharpness > best_sharpness and sharpness > AUTO_CAPTURE_THRESHOLD:
-            best_sharpness = sharpness
-            best_frame = frame.copy()
-            best_markers = marker_bounding_boxes
-            frames_since_peak = 0
-            peak_detected = True
-        elif peak_detected:
-            frames_since_peak += 1
-
-        if peak_detected and frames_since_peak >= STABLE_FRAMES_REQUIRED:
-            if best_sharpness > AUTO_CAPTURE_THRESHOLD:
-                frame = best_frame
-                marker_bounding_boxes = best_markers
-                should_capture = True
-                # Reset
-                best_sharpness = 0
-                peak_detected = False
+        if focus_calibrated:
+            # INSTANT MODE: Capture immediately when markers detected
+            # No waiting for sharpness - focus is pre-calibrated
+            should_capture = True
+            cooldown_counter = COOLDOWN_FRAMES
+            print(f"       [Instant capture] Sharpness: {int(sharpness)}")
+        else:
+            # NORMAL MODE: Wait for sharpness peak
+            if sharpness > best_sharpness and sharpness > AUTO_CAPTURE_THRESHOLD:
+                best_sharpness = sharpness
+                best_frame = frame.copy()
+                best_markers = marker_bounding_boxes
                 frames_since_peak = 0
-                cooldown_counter = COOLDOWN_FRAMES
+                peak_detected = True
+            elif peak_detected:
+                frames_since_peak += 1
+
+            if peak_detected and frames_since_peak >= STABLE_FRAMES_REQUIRED:
+                if best_sharpness > AUTO_CAPTURE_THRESHOLD:
+                    frame = best_frame
+                    marker_bounding_boxes = best_markers
+                    should_capture = True
+                    # Reset
+                    best_sharpness = 0
+                    peak_detected = False
+                    frames_since_peak = 0
+                    cooldown_counter = COOLDOWN_FRAMES
 
     # Handle keys
     key = cv2.waitKey(1) & 0xFF
@@ -784,6 +806,27 @@ while True:
     elif key == ord('a'):
         auto_capture_enabled = not auto_capture_enabled
         print(f"       Auto-capture: {'ON' if auto_capture_enabled else 'OFF'}")
+    elif key == ord('c'):  # Calibrate focus for instant capture
+        if ids is not None and len(ids) == 4:
+            # Lock focus at current position
+            CAMERA.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+            # Get current focus value and lock it
+            current_focus = int(CAMERA.get(cv2.CAP_PROP_FOCUS))
+            CAMERA.set(cv2.CAP_PROP_FOCUS, current_focus)
+            manual_focus_mode = True
+            focus_calibrated = True
+            calibrated_sharpness = sharpness
+            print(f"       FOCUS CALIBRATED!")
+            print(f"       Focus locked at: {current_focus}")
+            print(f"       Baseline sharpness: {int(sharpness)}")
+            print(f"       Instant capture mode ENABLED - will capture immediately when card detected")
+        else:
+            print(f"       Cannot calibrate - place a card first (need 4 markers, found {len(ids) if ids is not None else 0})")
+    elif key == ord('u'):  # Uncalibrate - return to normal mode
+        focus_calibrated = False
+        CAMERA.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+        manual_focus_mode = False
+        print(f"       Focus UNCALIBRATED - returned to auto-focus mode")
     elif key == ord('f'):
         manual_focus_mode = not manual_focus_mode
         if manual_focus_mode:
