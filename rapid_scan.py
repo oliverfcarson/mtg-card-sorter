@@ -14,7 +14,12 @@ import time
 import json
 import csv
 import os
+import argparse
 from datetime import datetime
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--camera", type=int, default=None, help="Camera index to use (skips auto-detection)")
+args = parser.parse_args()
 
 print("=" * 50)
 print("MTG Rapid Card Scanner")
@@ -592,24 +597,46 @@ print("\n[3/4] Opening webcam...")
 CAMERA = None
 camera_index = None
 
-for idx in range(5):
-    print(f"       Trying camera index {idx}...")
+WARMUP_FRAMES = 10
+
+def try_open_camera(idx):
+    """Open a camera, read warm-up frames, and return it if it produces a real image."""
     cam = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-    if cam.isOpened():
-        ret, test_frame = cam.read()
-        if ret and test_frame is not None:
+    if not cam.isOpened():
+        cam.release()
+        return None
+    # Read warm-up frames — first few are often black on Windows
+    for _ in range(WARMUP_FRAMES):
+        ret, frame = cam.read()
+        if ret and frame is not None and frame.any():
+            return cam
+        time.sleep(0.05)
+    cam.release()
+    return None
+
+if args.camera is not None:
+    print(f"       Using specified camera index {args.camera}...")
+    CAMERA = try_open_camera(args.camera)
+    if CAMERA is not None:
+        camera_index = args.camera
+        print(f"       Camera {args.camera} opened successfully!")
+    else:
+        print(f"\nERROR: Could not open camera at index {args.camera}!")
+        exit(1)
+else:
+    for idx in range(5):
+        print(f"       Trying camera index {idx}...")
+        cam = try_open_camera(idx)
+        if cam is not None:
             print(f"       Found working camera at index {idx}!")
             CAMERA = cam
             camera_index = idx
             break
-        else:
-            cam.release()
-    else:
-        cam.release()
 
-if CAMERA is None:
-    print("\nERROR: Could not find any working camera!")
-    exit(1)
+    if CAMERA is None:
+        print("\nERROR: Could not find any working camera!")
+        print("       Try specifying a camera index with --camera <index>")
+        exit(1)
 
 CAMERA.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
 CAMERA.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
